@@ -1,0 +1,1341 @@
+---
+title: "UMR_genome_annotation_maize"
+author: "Jaclyn Noshay"
+date: "1/28/2020"
+output: html_document
+---
+
+# Plan:
+
+Call UMRs based on the maive UMR v4 approach
+
+# Overview:
+
+Merge the mC context files with the reference tiles file and then call methylation domains:
+
+## Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+library(tidyverse)
+library(ggthemes)
+library("seqinr")
+old.scipen <- getOption("scipen")
+options(scipen=999)
+library(wesanderson)
+library(RColorBrewer)
+library(ggalluvial)
+library(tidytext)
+
+text_size_theme_8 <- theme(axis.text=element_text(size=8),
+        axis.title=element_text(size=8),
+        axis.text.x=element_text(angle = 45, hjust = 1),
+        legend.title=element_text(size=8),
+        legend.text=element_text(size=8))
+
+# text sizes
+text_size_theme_8_labels <- theme(axis.text=element_text(size=8),
+        axis.title=element_text(size=8),
+        axis.text.x=element_text(angle = 45, hjust = 1),
+        legend.title=element_text(size=8),
+        legend.text=element_text(size=8),
+        panel.background = element_rect(fill = "transparent") # bg of the panel
+    , plot.background = element_rect(fill = "transparent", color = NA) # bg of the plot
+    , panel.grid.major = element_blank() # get rid of major grid
+    , panel.grid.minor = element_blank() # get rid of minor grid
+    , legend.background = element_rect(fill = "transparent") # get rid of legend bg
+    , legend.box.background = element_rect(fill = "transparent")) # get rid of legend panel bg
+# magic geom_text conversion ratio
+# https://stackoverflow.com/questions/17311917/ggplot2-the-unit-of-size
+label_size = 25.4/72 * 8
+
+
+```
+
+# Call mC domains II
+
+Use 
+
+SITES = 2
+COVERAGE = 5
+
+1. seperately annotating tiles without sufficient sites vs sufficient data.
+
+## MSI set up
+
+```{r, engine = 'bash'}
+
+qsub -I -l walltime=24:00:00,nodes=1:ppn=2,mem=40gb
+qsub -I -l walltime=2:00:00,nodes=1:ppn=2,mem=40gb
+
+# args
+species_folder=mC_maize
+sample_to_crunch=BN_4_S3_R1_001
+annotation_suffix=_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1
+chrom_sizes_path=/home/springer/nosha003/database/B73v4/B73v4_chr_size.txt
+
+cd /scratch.global/nosha003/wgbs/analysis/
+
+module load R
+R
+
+```
+
+```{r}
+
+library(tidyverse)
+library(ggthemes)
+# library("seqinr")
+old.scipen <- getOption("scipen")
+options(scipen=999)
+# library(wesanderson)
+library(RColorBrewer)
+
+text_size_theme_8 <- theme(axis.text=element_text(size=8),
+        axis.title=element_text(size=8),
+        axis.text.x=element_text(angle = 45, hjust = 1),
+        legend.title=element_text(size=8),
+        legend.text=element_text(size=8))
+
+sample_to_crunch = "BN_4_S3_R1_001"
+species_name = "maize"
+genome = "B73v4"
+
+######## filter args
+coverage_filter_min = 5
+site_filter_min = 2
+MR_percent = 0.4
+UMR_percent = 0.1
+
+########
+
+folder_prefix = paste0(sample_to_crunch, "_mC_domains_II", 
+                                    "_cov_",coverage_filter_min, 
+                                    "_sites_",site_filter_min, 
+                                    "_MR_",MR_percent,
+                                    "_UTR_",UMR_percent)
+dir.create(folder_prefix, showWarnings = F)
+
+out_dir = paste0(folder_prefix, "/mC_UMT_annotation")
+dir.create(out_dir, showWarnings = F)
+
+out_dir_beds = paste0(folder_prefix, "/mC_UMT_annotation_beds")
+dir.create(out_dir_beds, showWarnings = F)
+
+######
+
+#############
+# folders
+umr_out_dir = paste0(folder_prefix, "/mC_UMR_annotation")
+dir.create(out_dir, showWarnings = F)
+
+umr_out_dir_beds = paste0(folder_prefix, "/mC_UMR_annotation_beds")
+dir.create(out_dir_beds, showWarnings = F)
+
+#############
+
+```
+
+
+## read in mC tile data
+
+Need to make tiles still!
+
+```{r}
+
+#reference_tiles <- read_tsv(paste0("~/ws/refseqs/",  species_name, "/sites/", genome, "_100bp_tiles_zBased_sites_counts.txt"), col_names = T,
+#                            cols(
+#  chr = col_character(), 
+#  start = col_integer(), 
+#  end = col_integer()))
+
+reference_tiles <- read_tsv(paste0("/scratch.global/nosha003/wgbs/sites/", species_name, "_100bp_tiles_zBased_sites_counts.txt"), col_names = T,
+                            cols(
+  chr = col_character(), 
+  start = col_integer(), 
+  end = col_integer()))
+
+
+reference_tiles <- reference_tiles %>% select(-start_zBased)
+
+reference_tiles %>% distinct(chr)
+
+# Make decision about whether using contigs
+reference_tiles %>% mutate(size = end - start) %>% summarise(MB = sum(size)/1000000)
+# 2114
+
+###########
+
+# read in CG
+CG <- read_tsv(paste0("tiles/", sample_to_crunch, "_BSMAP_out.txt.100.CG.fixed.sorted.txt"), col_names = T, cols_only(
+  chr = col_character(), 
+  start = col_integer(), 
+  end = col_integer(),
+  CT = col_integer(),
+  ratio = col_double(),
+  cg_sites = col_integer())) %>% mutate(cov = CT/cg_sites)
+
+g <- ggplot(CG, aes(x = cov)) +
+  geom_density() +
+  theme_minimal() +
+  xlim(0,25) +
+  geom_vline(xintercept = c(coverage_filter_min), colour = 'blue', linetype = 'dashed') +
+  text_size_theme_8
+
+ggsave(plot = g, filename = paste0(out_dir, "/mC_CG_cov_density.pdf"), h = 1.5, w = 2)
+
+# read in CHG
+CHG <- read_tsv(paste0("tiles/", sample_to_crunch, "_BSMAP_out.txt.100.CHG.fixed.sorted.txt"), col_names = T, cols_only(
+  chr = col_character(), 
+  start = col_integer(), 
+  end = col_integer(),
+  CT = col_integer(),
+  ratio = col_double(),
+  chg_sites = col_integer())) %>% mutate(cov = CT/chg_sites)
+
+g <- ggplot(CHG, aes(x = cov)) +
+  geom_density() +
+  theme_minimal() +
+  xlim(0,25) +
+  geom_vline(xintercept = c(coverage_filter_min), colour = 'blue', linetype = 'dashed') +
+  text_size_theme_8
+
+ggsave(plot = g, filename = paste0(out_dir, "/mC_CHG_cov_density.pdf"), h = 1.5, w = 2)
+
+# read in CHH
+CHH <- read_tsv(paste0("tiles/", sample_to_crunch, "_BSMAP_out.txt.100.CHH.fixed.sorted.txt"), col_names = T, cols_only(
+  chr = col_character(), 
+  start = col_integer(), 
+  end = col_integer(),
+  CT = col_integer(),
+  ratio = col_double(),
+  chh_sites = col_integer())) %>% mutate(cov = CT/chh_sites)
+
+g <- ggplot(CHH, aes(x = cov)) +
+  geom_density() +
+  theme_minimal() +
+  xlim(0,25) +
+  geom_vline(xintercept = c(coverage_filter_min), colour = 'blue', linetype = 'dashed') +
+  text_size_theme_8
+
+ggsave(plot = g, filename = paste0(out_dir, "/mC_CHH_cov_density.pdf"), h = 1.5, w = 2)
+
+
+
+```
+
+
+## Filter 
+
+### function
+
+```{r}
+
+# annotate_mC_domains <- function(coverage_filter_min, site_filter_min, MR_percent, UMR_percent){
+
+# filter
+CG_ratio <- CG %>% 
+  mutate(CG = ifelse(cg_sites < site_filter_min | cov < coverage_filter_min, NA, ratio)) %>%
+  select(chr, start, end, CG)
+
+# filter
+CHG_ratio <- CHG %>% 
+  mutate(CHG = ifelse(chg_sites < site_filter_min | cov < coverage_filter_min, NA, ratio)) %>%
+  select(chr, start, end, CHG)
+
+# filter
+CHH_ratio <- CHH %>% 
+  mutate(CHH = ifelse(chh_sites < site_filter_min | cov < coverage_filter_min, NA, ratio)) %>%
+  select(chr, start, end, CHH)
+
+############
+# merge with reference
+# call tiles with no sites
+merged_mC <- reference_tiles %>% 
+  # select("chr", "start", "end") %>%
+  left_join(CG_ratio, by = c("chr", "start", "end")) %>%
+  left_join(CHG_ratio, by = c("chr", "start", "end")) %>%
+  left_join(CHH_ratio, by = c("chr", "start", "end")) %>%
+  mutate(cg_sites = ifelse(cg_sites < site_filter_min, "n", "y"),
+         chg_sites = ifelse(chg_sites < site_filter_min, "n", "y"),
+         chh_sites = ifelse(chh_sites < site_filter_min, "n", "y"))
+                           
+print(reference_tiles, n = 20)
+print(CHG_ratio, n = 20)
+print(merged_mC, n = 20)
+
+
+# remove organelles
+merged_mC %>% distinct(chr)
+merged_mC_sans_orgs <- merged_mC %>% filter(!chr %in% c("Mt", "Pt")) 
+
+merged_mC_sans_orgs
+
+###################
+# distribution and averages of mC levels
+
+# distro
+plot_data <- merged_mC_sans_orgs %>% slice(1:10000) %>%
+  select(CG:CHH) %>%
+  gather(key = context, value = percent) %>%
+  mutate(percent = percent *100)
+
+g <- ggplot(plot_data, aes(x = percent)) +
+  geom_density() +
+  geom_vline(xintercept = c(UMR_percent*100, MR_percent*100), colour = 'blue', linetype = 'dashed') +
+  facet_grid(context ~., scales = 'free') +
+  theme_minimal() +
+  text_size_theme_8
+
+ggsave(plot = g, filename = paste0(out_dir, "/mC_tile_density.pdf"), h = 4, w = 2)
+
+# mean
+plot_data_average <- plot_data %>%
+  group_by(context) %>%
+  summarise(mean = mean(percent, na.rm = T))
+
+g <- ggplot(plot_data_average, aes(x = context, y = mean)) +
+  geom_bar(stat = 'identity') +
+  ylim(0,100) +
+    theme_minimal() +
+  text_size_theme_8
+
+ggsave(plot = g, filename = paste0(out_dir, "/mC_tile_average_mC.pdf"), h = 2, w = 1.1)
+
+write.table(plot_data_average, paste0(out_dir,"/", sample_to_crunch, "mC_tile_average_mC.tsv"), sep = "\t", quote = F, row.names = F, col.names = T)
+
+###################
+## Annotate domains
+
+### CHG mC domains
+mC_domains <- merged_mC_sans_orgs %>%
+  mutate(domain_tmp = ifelse(chg_sites == "n", "no_sites", #this catches tiles with no CHG sites
+                  ifelse(CHG >= MR_percent, "MR", #this catches sites with no data too: they get NA
+                  ifelse(CHG < UMR_percent, "UMR", "Intermediate")))) %>%
+         mutate(CHG_based_domain = ifelse(is.na(domain_tmp), "Missing_Data", domain_tmp))
+
+mC_domains
+
+
+### 40% mC
+# be careful this steps are maize specific and would need to be adjusted to another species...
+mC_domains2 <- mC_domains %>%
+  mutate(domain_tmp = ifelse(chh_sites == "n", "no_sites", #this will catch the 1.45% of the genome that lack CHH sites (or any other site)
+                  ifelse(CHH >= 0.15, "RdDM", # 
+                  ifelse(cg_sites == "n" & chg_sites == "y" & CHG >= MR_percent, "Heterochromatin", # this catches tiles with CHG mC but no CG sites (otherwise they would get NA)
+                  ifelse(cg_sites == "y" & chg_sites == "y" & CHG >= MR_percent & CG >= MR_percent, "Heterochromatin",
+                  ifelse(cg_sites == "y" & CG >= MR_percent, "CG_only", 
+                  ifelse(cg_sites == "y" & chg_sites == "y" & CG < UMR_percent & CHG < UMR_percent & CHH < UMR_percent, "Unmethylated",
+                         ifelse(cg_sites == "n" & chg_sites == "y" & CHG < UMR_percent & CHH < UMR_percent, "Unmethylated",
+                                ifelse(cg_sites == "y" & chg_sites == "n" & CG < UMR_percent & CHH < UMR_percent, "Unmethylated",
+                   ifelse(cg_sites == "y" & chg_sites == "y" & CG >= UMR_percent & CHG >= UMR_percent & CHH >= UMR_percent, "Intermediate",
+                         ifelse(cg_sites == "n" & chg_sites == "y" & CHG >= UMR_percent & CHH >= UMR_percent, "Intermediate",
+                                ifelse(cg_sites == "y" & chg_sites == "n" & CG >= UMR_percent & CHH >= UMR_percent, "Intermediate",
+                  ifelse(cg_sites == "n" | chg_sites == "n", "no_sites", NA))))))))))))) %>%
+         mutate(domain = ifelse(is.na(domain_tmp), "Missing_Data", domain_tmp)) %>%
+  mutate(domain_simple = ifelse(domain == "Heterochromatin", "MR", 
+                          ifelse(domain == "Missing_Data", "no_data",
+                          ifelse(domain == "Unmethylated", "UMR", 
+                          ifelse(domain == "no_sites", "No_sites","other_mC")))))
+
+mC_domains2
+
+############
+## summarise
+
+mC_domains_freq <- mC_domains2 %>% 
+  group_by(domain) %>% 
+  summarise(total = n()) %>% 
+  ungroup() %>% 
+  mutate(percent = total/sum(total)*100,
+         MB = total*100/1000000)
+mC_domains_freq
+
+write.table(mC_domains_freq, paste0(out_dir,"/", sample_to_crunch, "_mC_domains", 
+                                    "_cov_",coverage_filter_min, 
+                                    "_sites_",site_filter_min, 
+                                    "_MR_",MR_percent,
+                                    "_UMR_",UMR_percent,
+                                    "_freq.tsv"), sep = "\t", quote = F, row.names = F, col.names = T)
+
+# plot
+domain_order <- c("Heterochromatin", "RdDM", "CG_only", "Unmethylated", "Intermediate", "no_sites", "Missing_Data")
+
+mC_domains_freq_plot <- mC_domains_freq %>%
+  gather(key = metric, value = number, -domain) %>%
+  mutate(domain = factor(domain, levels = domain_order))
+
+g <- ggplot(mC_domains_freq_plot, aes(x = domain, y = number)) +
+  geom_bar(stat = 'identity') +
+  facet_grid(metric ~ ., scales = 'free') +
+    theme_minimal() +
+  text_size_theme_8
+
+ggsave(plot = g, filename = paste0(out_dir, "/mC_domain_bar.pdf"), h = 4, w = 2)
+
+######
+mC_domains_freq_simple <- mC_domains2 %>% 
+  group_by(domain_simple) %>% 
+  summarise(total = n()) %>% 
+  ungroup() %>% 
+  mutate(percent = total/sum(total)*100,
+         MB = total*100/1000000)
+mC_domains_freq_simple
+
+write.table(mC_domains_freq_simple, paste0(out_dir,"/", sample_to_crunch, "_mC_domains_simple", 
+                                    "_cov_",coverage_filter_min, 
+                                    "_sites_",site_filter_min, 
+                                    "_MR_",MR_percent,
+                                    "_UMR_",UMR_percent,
+                                    "_freq.tsv"), sep = "\t", quote = F, row.names = F, col.names = T)
+
+mC_domains_freq_CHG <- mC_domains2 %>% 
+  group_by(CHG_based_domain) %>% 
+  summarise(total = n()) %>% 
+  ungroup() %>% 
+  mutate(percent = total/sum(total)*100,
+         MB = total*100/1000000)
+mC_domains_freq_CHG
+
+write.table(mC_domains_freq_CHG, paste0(out_dir,"/", sample_to_crunch, "_mC_domains_CHG", 
+                                    "_cov_",coverage_filter_min, 
+                                    "_sites_",site_filter_min, 
+                                    "_MR_",MR_percent,
+                                    "_UMR_",UMR_percent,
+                                    "_freq.tsv"), sep = "\t", quote = F, row.names = F, col.names = T)
+
+
+######################### #########################
+
+######################### #########################
+# write bed file
+mC_domains_bed <- mC_domains2 %>%
+   mutate(start = start-1, 
+         score = ".",
+         strand = ".") %>%
+  select(chr, start, end, domain, score, strand)
+
+write.table(mC_domains_bed, paste0(out_dir_beds,"/", sample_to_crunch, "_mC_domains", 
+                                    "_cov_",coverage_filter_min, 
+                                    "_sites_",site_filter_min, 
+                                    "_MR_",MR_percent,
+                                    "_UMR_",UMR_percent,".bed"), sep = "\t", quote = F, row.names = F, col.names = F)
+
+# write the whole data file
+write.table(mC_domains2, paste0(out_dir_beds,"/", sample_to_crunch, "_mC_domains", 
+                                    "_cov_",coverage_filter_min, 
+                                    "_sites_",site_filter_min, 
+                                    "_MR_",MR_percent,
+                                    "_UMR_",UMR_percent,".txt"), sep = "\t", quote = F, row.names = F, col.names = T)
+
+
+# }
+
+
+```
+
+
+# Merging UMTs and no data/no sites
+
+1. Run bedtools closest on merged no data/no sites vs UMRs
+2. Keep any no data tile that has distance = 1 and 2 closest UMRs
+3. get those tiles and merge into UMRs
+4. Calculate how many UMRs get consolidated and how the size categories totals change.
+5. Filter 200 and under UMRs
+
+## Make UMT and ND only bed files
+
+make UMR only bedfile
+
+
+```{r}
+# read in ref
+mC_domains <- read_tsv(paste0(out_dir_beds,"/", sample_to_crunch, "_mC_domains", 
+                                    "_cov_",coverage_filter_min, 
+                                    "_sites_",site_filter_min, 
+                                    "_MR_",MR_percent,
+                                    "_UMR_",UMR_percent,".txt"))
+
+mC_domains %>% distinct(chr)
+
+############# UMTs
+# subset to UMTs
+mC_domains %>% distinct(domain)
+UMT_only <- mC_domains %>% 
+  filter(domain == "Unmethylated") %>%
+  mutate(start = start-1) %>%
+  select(chr:end, domain)
+UMT_only
+# 1,256,209
+
+# 1256209 / 21063387 = 0.05963946 * 100 = 6% of the tiles in the genome are unmethylated
+
+write.table(UMT_only, paste0(out_dir_beds, "/",sample_to_crunch, "_UMTs.bed"), sep = "\t", quote = F, row.names = F, col.names = F)
+
+############# Missing data nd no sites
+# subset to NDs
+ND_only <- mC_domains %>% 
+  filter(domain %in% c("Missing_Data", "no_sites")) %>%
+  mutate(start = start-1) %>%
+  select(chr:end, domain)
+ND_only
+# 10,594,333
+
+# 10594333 / 21063387 = 0.5029739 * 100 = 50% of the tiles in the genome have no data/no sites?
+
+write.table(ND_only, paste0(out_dir_beds, "/", sample_to_crunch, "_NDs.bed"), sep = "\t", quote = F, row.names = F, col.names = F)
+
+```
+
+### Merge and sort UMRs
+
+Do I need to keep the domain column?
+
+```{r, engine = 'bash'}
+
+module load bedtools
+
+#less ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs.bed
+
+# 
+sort -k1,1 -k2,2n ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs.bed > ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_sorted.bed
+
+bedtools merge -i ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_sorted.bed > ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_sorted_merge.bed
+
+wc -l ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_sorted.bed
+
+wc -l ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_sorted_merge.bed
+
+less ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_sorted_merge.bed
+q
+
+
+# BN_4_S3_R1_001
+sort -k1,1 -k2,2n BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs.bed > BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_sorted.bed
+bedtools merge -i BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_sorted.bed > BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_sorted_merge.bed
+wc -l BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_sorted.bed
+# 1256209 * 100 / 1000000
+wc -l BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_sorted_merge.bed
+# 244847
+less BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_sorted_merge.bed
+q
+```
+
+
+Read into R and filter to add size column
+
+```{r}
+# read in ref
+mC_domains_merge <- read_tsv(paste0(out_dir_beds,"/", sample_to_crunch, "_UMTs_sorted_merge.bed"), col_names =  c("chr","start", "end"))
+
+mC_domains_merge <- mC_domains_merge %>%
+  mutate(type = "UMT",
+         size = end-start,
+         location = paste0(chr, ":", start, ":", end))
+
+write.table(mC_domains_merge, paste0(out_dir_beds, "/", sample_to_crunch, "_UMTs_merge_size.bed"), sep = "\t", quote = F, row.names = F, col.names = F)
+
+```
+
+Sort
+
+```{r, engine = 'bash'}
+
+sort -k1,1 -k2,2n ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_merge_size.bed > \
+${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_merge_size_sorted.bed
+
+
+
+# BN_4_S3_R1_001
+sort -k1,1 -k2,2n BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_size.bed > \
+BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_size_sorted.bed
+
+```
+
+
+
+### Merge and sort NDs
+
+```{r, engine = 'bash'}
+
+module load bedtools
+# 
+sort -k1,1 -k2,2n ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_NDs.bed > ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_NDs_sorted.bed
+
+bedtools merge -i ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_NDs_sorted.bed > ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_NDs_sorted_merge.bed
+
+wc -l ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_NDs_sorted.bed
+3372705
+5030855-maize
+
+wc -l ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_NDs_sorted_merge.bed
+821221
+1520303-maize
+
+
+
+# BN_4_S3_R1_001
+module load bedtools
+sort -k1,1 -k2,2n BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_NDs.bed > BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_NDs_sorted.bed
+
+bedtools merge -i BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_NDs_sorted.bed > BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_NDs_sorted_merge.bed
+
+wc -l BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_NDs_sorted.bed
+10594333 (why so many more than Petes?)
+5030855-maize (Pete)
+
+wc -l BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_NDs_sorted_merge.bed
+2320014
+1520303-maize (Pete)
+
+```
+
+### find NDs tile between UMTs
+
+Got a warning here due to the name chaecking function... I think its a false negative
+
+```{r, engine = 'bash'}
+
+bedtools closest \
+-a ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_NDs_sorted_merge.bed \
+-b ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_merge_size_sorted.bed \
+-t all \
+-d \
+-g $chrom_sizes_path \
+> ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/NDs_Olap_UMTs.bed
+
+less ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/NDs_Olap_UMTs.bed
+
+
+
+# BN_4_S3_R1_001
+sort -k 1,1 -k 2,2n /scratch.global/nosha003/wgbs/maize.chrom.sizes > /scratch.global/nosha003/wgbs/maize.chrom.sizes.sort
+
+bedtools closest \
+-a BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_NDs_sorted_merge.bed \
+-b BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_size_sorted.bed \
+-t all \
+-d \
+-g /scratch.global/nosha003/wgbs/maize.chrom.sizes.sort \
+> BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/NDs_Olap_UMTs.bed
+
+less BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/NDs_Olap_UMTs.bed
+
+```
+
+Read into R and filter to NDs with distance 1 and two closest tiles. Adjacent tiles have a distance of 1
+
+Add a size colum 
+
+and also a column for their co-ordinates
+
+remove black listed regions on second pass
+
+```{r}
+# read in ref
+# read b_size as ccharacter because there are some dots
+ND_overlaps <- read_tsv(paste0(out_dir_beds, "/NDs_Olap_UMTs.bed"), col_names =  c("chr","start", "end","B_chr", "b_start", "b_end", "b_type","b_size", "b_location", "distance"), 
+                        cols(b_size = col_character()))
+
+ND_overlaps %>% mutate(name = "ND", size = end-start) %>% summarise(max(size))
+# 4.8 MB!
+
+ND_overlaps <- ND_overlaps %>%
+  filter(distance == 1) %>%
+  group_by(chr, start, end) %>%
+  mutate(hits = n())
+
+ND_overlaps %>% group_by(hits) %>% summarise(n_hits = n())
+
+# 1 = 107,967 (maize, 97,422)
+# 2 = 196,624 (maize 73,890)
+# So 107,967 of the merged ND tiles are adjacent to a UMT; while ~100k (x/2) are inbetween adjacent UMTs
+# double maize on inbetweeners
+
+# my numbers (above are Pete's numbers) 
+# 1 108,280
+# 2  94,574
+
+ND_between_UMTs <- ND_overlaps %>%
+  filter(hits == 2) %>%
+  distinct(chr, start, end) %>%
+  ungroup() %>%
+  mutate(name = "ND", size = end-start,
+         location = paste0(chr, ":", start, ":", end))
+
+max(ND_between_UMTs$size)
+# 100?
+
+# 92800
+
+g <- ND_between_UMTs %>% filter(size < 1000) %>%
+ggplot(., aes(size)) +
+  geom_density() +
+  theme_minimal() +
+  text_size_theme_8
+
+ggsave(plot = g, filename = paste0(out_dir, "/ND_inbetweens_size_density.pdf"), h = 3, w = 3)
+
+write.table(ND_between_UMTs, paste0(out_dir_beds, "/", sample_to_crunch, "_NDs_between_UMTs.bed"), sep = "\t", quote = F, row.names = F, col.names = F)
+
+```
+
+I MUST BE UP TO HERE
+
+First merge the NDs to calculate % ND and get the black list
+The repeat in a second block below to remove black list in-betweeners and merge the filtered list
+
+### Merge NDs inbetween UMTs
+
+```{r, engine = 'bash'}
+
+module load bedtools
+
+# combine files and sort 
+cat \
+${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_merge_size_sorted.bed \
+${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_NDs_between_UMTs.bed \
+| sort -k1,1 -k2,2n > ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/input.bed
+
+less ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/input.bed
+
+# merge making a delimited list of cols 4 and 5 - 
+# col 4 this mark tiles with NDs in them and also retain metafeatures for subsequent filtering for distal tiles and 
+# col 5 this is the siz of the tile - I want to filter after merging to mark any tile that is more than 30% (?) NDs - probably have to work backwards to un merge these???
+
+bedtools merge -i ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/input.bed \
+-c 4,5,6 -o collapse,collapse,collapse > \
+${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_merge_NDs.bed
+
+wc -l ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_sorted_merge_size.bed
+329888 (maize 241801)
+
+wc -l ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_merge_NDs.bed
+231576 (maize 206976)
+
+(329888-231576)
+(329888-231576)/329888*100
+# this reduced the numner of merged UMTs by 98312  or 30% (compared to 15.3% for maize)
+
+
+
+
+
+## BN_4_S3_R1_001
+cat \
+BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_size_sorted.bed \
+BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_NDs_between_UMTs.bed \
+| sort -k1,1 -k2,2n > BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/input.bed
+
+less BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/input.bed
+
+# merge making a delimited list of cols 4 and 5 - 
+# col 4 this mark tiles with NDs in them and also retain metafeatures for subsequent filtering for distal tiles and 
+# col 5 this is the siz of the tile - I want to filter after merging to mark any tile that is more than 30% (?) NDs - probably have to work backwards to un merge these???
+
+bedtools merge -i BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/input.bed \
+-c 4,5,6 -o collapse,collapse,collapse > \
+BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_NDs.bed
+
+wc -l BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_size_sorted.bed
+244847 (Pete maize 241801)
+
+wc -l BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_NDs.bed
+197560 (Pete maize 206976)
+
+(244847-197560)
+# 47287
+(244847-197560)/244847*100
+# 19.31288
+
+# this reduced the numner of merged UMTs by 47287  or 19% (compared to 15.3% for Pete's maize)
+
+
+```
+
+Read into R and filter UMTs that are too high % NDs 
+
+```{r}
+# read in ref
+ND_overlaps <- read_tsv(paste0(out_dir_beds, "/", sample_to_crunch, "_UMTs_merge_NDs.bed"), col_names =  c("chr","start", "end", "features", "sizes", "locations"),
+                        cols(sizes = col_character()))
+
+ND_overlaps_sizes <- ND_overlaps %>% 
+  mutate(features = strsplit(as.character(features), ","),
+         sizes = strsplit(as.character(sizes), ","),
+         locations = strsplit(as.character(locations), ",")) %>% 
+  unnest(features, sizes, locations)
+
+ND_overlaps_sizes
+
+# check size distribution before merging
+
+size_distro <- ND_overlaps_sizes %>%
+  filter(!features == "ND") %>%
+  mutate(size_cat = ifelse(as.double(sizes) < 300, "small", 
+                      ifelse(as.double(sizes) >=300 & as.double(sizes) <900, "med", "large"))) 
+#size summary
+size_distro %>% group_by(size_cat) %>% summarise(n = n()) %>% mutate(pct = n/sum(n)*100)
+
+# how often are the mergers longer than 3?
+
+ND_overlaps_sizes %>% group_by(chr, start, end) %>% summarise(n = n()) %>% group_by(n) %>% summarise(freq = n())
+
+ND_overlaps_sizes %>% group_by(chr, start, end) %>% summarise(n = n()) %>% group_by(n) %>% summarise(freq = n()) %>% filter(!n %in% c(1, 3)) %>% summarise(total = sum(freq))
+
+# features_metadata <- ND_overlaps_sizes %>% 
+#   mutate(cat = ifelse(features == "ND", "ND", "UMR")) %>%
+#   filter(cat == "UMR") %>%
+#   group_by(chr, start, end) %>%
+#   summarise(features = paste(features, collapse = "|"))
+
+# calculate percent ND
+ND_overlaps_sizes_pct <- ND_overlaps_sizes %>% 
+  mutate(cat = ifelse(features == "ND", "ND", "UMR")) %>%
+  group_by(chr, start, end, cat) %>% 
+  summarise(total_size = sum(as.double(sizes))) %>%
+  ungroup() %>%
+  spread(key = cat, value = total_size) %>%
+  replace(., is.na(.), 0) %>%
+  mutate(pct_ND = ND/(ND + UMR) *100)
+  
+ND_overlaps_sizes_pct
+
+# summarise percent of UMR tiles
+ND_overlaps_sizes_pct_summary <- ND_overlaps_sizes_pct %>%
+  mutate(cat = ifelse(pct_ND == 0 , 0, ifelse(pct_ND > 34, ">34", "<=34"))) %>%
+  group_by(cat) %>%
+  summarise(n = n())
+
+ND_overlaps_sizes_pct_summary
+#  cat        n
+#  <chr>  <int>
+#1 0     161834
+#2 <=34   33239
+#3 >34     2487
+
+################## ################## ##################
+################## ################## ##################
+ # run this chunk the forst time through to get black list
+
+# filter to tile >34% ND
+over_34_pct <- ND_overlaps_sizes_pct  %>%
+  mutate(cat = ifelse(pct_ND == 0 , 0, ifelse(pct_ND > 34, ">34", "<=34"))) %>% 
+  filter(cat == ">34") %>% 
+  select(chr, start, end, cat) %>%
+  right_join(ND_overlaps_sizes, by = c("chr", "start", "end")) %>%
+  filter(cat == ">34") 
+over_34_pct
+
+# number of concatonated tiles
+over_34_pct %>% group_by(chr, start, end) %>% summarise(n = n()) %>% group_by(n) %>% summarise(freq = n())
+
+# plot size distributin of tiles
+g <- over_34_pct %>% ungroup() %>% filter(features == "ND") %>% filter(as.double(sizes) < 2000)  %>%
+ggplot(., aes(as.double(sizes))) +
+  geom_density() +
+  theme_minimal() +
+  text_size_theme_8
+
+ggsave(plot = g, filename = paste0(out_dir, "/ND_inbetweens_size_density_over_34.pdf"), h = 3, w = 3)
+
+# extract list of ND tiles that contribute to merges that are >34% to get blacklist
+
+black_list <- over_34_pct %>% 
+  filter(features == "ND") %>% # 2,120
+  select(locations, cat) %>%
+  separate(locations, into = c("chr", "start", "end"), sep = ":")
+
+write.table(black_list,  paste0(out_dir_beds,"/", sample_to_crunch, "_NDs_between_UMTs_black_list.bed"), sep = "\t", quote = F, row.names = F, col.names = F)
+
+################## ################## ##################
+################## ################## ##################
+
+# # add sizes
+# # merge back in features metadata
+# ND_overlaps_sizes_pct_meta <- ND_overlaps_sizes_pct %>%
+#   left_join(features_metadata, by = c("chr", "start", "end"))
+# 
+# ND_overlaps_sizes_pct %>% distinct(chr, start, end)
+# 
+# # write output
+# write.table(ND_overlaps_sizes_pct_meta, "B73L_mC_domains_v1_annotation_v0_4_UMTs_merge_NDs_filtered.bed", sep = "\t", quote = F, row.names = F, col.names = F)
+
+```
+
+Remove black listed regions from the original ND merge
+
+```{r}
+# read in ref
+ND_overlaps <- read_tsv(paste0(out_dir_beds, "/NDs_Olap_UMTs.bed"), col_names =  c("chr","start", "end","B_chr", "b_start", "b_end", "b_type","b_size", "b_location", "distance"), 
+                        cols(b_size = col_character()))
+
+black_list <- read_tsv(paste0(out_dir_beds,"/", sample_to_crunch, "_NDs_between_UMTs_black_list.bed"), col_names =  c("chr","start", "end","cat"))
+
+ND_overlaps %>% mutate(name = "ND", size = end-start) %>% summarise(max(size))
+# 4.8 MB!
+
+ND_overlaps <- ND_overlaps %>%
+  filter(distance == 1) %>%
+  group_by(chr, start, end) %>%
+  mutate(hits = n())
+
+ND_overlaps %>% group_by(hits) %>% summarise(n_hits = n())
+
+# 1 = 108,280 (Pete maize, 97,422)
+# 2 = 94,574 (Pete maize 73,890)
+# So 108280 of the merged ND tiles are adjacent to a UMT; while ~100k (x/2) are inbetween adjacent UMTs
+# double maize on inbetweeners
+
+ND_between_UMTs <- ND_overlaps %>%
+  filter(hits == 2) %>%
+  distinct(chr, start, end) %>%
+  left_join(black_list, by = c("chr","start", "end")) %>%
+  ungroup() %>%
+  mutate(cat = ifelse(is.na(cat), "ok", cat)) %>%
+  filter(!cat == ">34") %>%
+  mutate(name = "ND", size = end-start,
+         location = paste0(chr, ":", start, ":", end)) %>%
+  select(-cat)
+
+max(ND_between_UMTs$size)
+# 100?
+
+ND_between_UMTs
+# 55477
+
+ND_between_UMTs %>% summarise(MB = sum(size)/1000000)
+
+write.table(ND_between_UMTs, paste0(out_dir_beds, "/", sample_to_crunch, "_NDs_between_UMTs_pct_filtered.bed"), sep = "\t", quote = F, row.names = F, col.names = F)
+
+```
+
+### Merge filtered NDs inbetween UMTs
+
+
+```{r, engine = 'bash'}
+
+module load bedtools
+
+# combine files and sort 
+cat \
+${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_merge_size_sorted.bed \
+${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_NDs_between_UMTs_pct_filtered.bed \
+| sort -k1,1 -k2,2n > ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/input2.bed
+
+less ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/input2.bed
+
+# merge making a delimited list of cols 4 and 5 - 
+# col 4 this mark tiles with NDs in them and also retain metafeatures for subsequent filtering for distal tiles and 
+# col 5 this is the siz of the tile - I want to filter after merging to mark any tile that is more than 30% (?) NDs - probably have to work backwards to un merge these???
+
+bedtools merge -i ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/input2.bed \
+-c 4,5,6 -o collapse,collapse,collapse > \
+${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_merge_NDs_pct_filtered.bed
+
+wc -l ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_merge_size_sorted.bed
+329888 (maize 241801)
+
+wc -l ${sample_to_crunch}${annotation_suffix}/mC_UMT_annotation_beds/${sample_to_crunch}_UMTs_merge_NDs_pct_filtered.bed
+274411 (maize 206976)
+
+(329888-274411)
+(329888-274411)/329888*100
+# this reduced the numner of merged UMTs by 55477 or 16.8% (compared to 15.3% for maize)
+
+
+
+
+## BN_4_S3_R1_001
+module load bedtools
+
+# combine files and sort 
+cat \
+BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_size_sorted.bed \
+BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_NDs_between_UMTs_pct_filtered.bed \
+| sort -k1,1 -k2,2n > BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/input2.bed
+
+less BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/input2.bed
+
+# merge making a delimited list of cols 4 and 5 - 
+# col 4 this mark tiles with NDs in them and also retain metafeatures for subsequent filtering for distal tiles and 
+# col 5 this is the siz of the tile - I want to filter after merging to mark any tile that is more than 30% (?) NDs - probably have to work backwards to un merge these???
+
+bedtools merge -i BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/input2.bed \
+-c 4,5,6 -o collapse,collapse,collapse > \
+BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_NDs_pct_filtered.bed
+
+wc -l BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_size_sorted.bed
+244847 (Pete maize 241801)
+
+wc -l BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMTs_merge_NDs_pct_filtered.bed
+201113 (Pete maize 206976)
+
+(244847-201113)
+(244847-201113)/244847*100
+# this reduced the numner of merged UMTs by 43734 or 17.9% (compared to 15.3% for Pete maize)
+
+
+```
+
+
+### UMR final list and Size annotation
+
+```{r}
+
+# read in ref
+ND_overlaps <- read_tsv(paste0(out_dir_beds, "/", sample_to_crunch, "_UMTs_merge_NDs_pct_filtered.bed"), col_names =  c("chr","start", "end", "features", "sizes", "locations"),
+                        cols(sizes = col_character()))
+
+ND_overlaps_sizes <- ND_overlaps %>% 
+  mutate(features = strsplit(as.character(features), ","),
+         sizes = strsplit(as.character(sizes), ","),
+         locations = strsplit(as.character(locations), ",")) %>% 
+  unnest(features, sizes, locations)
+
+ND_overlaps_sizes
+
+# check size distribution before merging
+
+size_distro <- ND_overlaps_sizes %>%
+  filter(!features == "ND") %>%
+  mutate(size_cat = ifelse(as.double(sizes) < 300, "small", 
+                      ifelse(as.double(sizes) >=300 & as.double(sizes) <900, "med", "large"))) 
+#size summary
+size_distro %>% group_by(size_cat) %>% summarise(n = n()) %>% mutate(pct = n/sum(n)*100)
+
+# how often are the mergers longer than 3?
+
+ND_overlaps_sizes %>% group_by(chr, start, end) %>% summarise(n = n()) %>% group_by(n) %>% summarise(freq = n())
+
+ND_overlaps_sizes %>% group_by(chr, start, end) %>% summarise(n = n()) %>% group_by(n) %>% summarise(freq = n()) %>% filter(!n %in% c(1, 3)) %>% summarise(total = sum(freq))
+
+# features_metadata <- ND_overlaps_sizes %>% 
+#   mutate(cat = ifelse(features == "ND", "ND", "UMR")) %>%
+#   filter(cat == "UMR") %>%
+#   group_by(chr, start, end) %>%
+#   summarise(features = paste(features, collapse = "|"))
+
+# calculate percent ND
+ND_overlaps_sizes_pct <- ND_overlaps_sizes %>% 
+  mutate(cat = ifelse(features == "ND", "ND", "UMR")) %>%
+  group_by(chr, start, end, cat) %>% 
+  summarise(total_size = sum(as.double(sizes))) %>%
+  ungroup() %>%
+  spread(key = cat, value = total_size) %>%
+  replace(., is.na(.), 0) %>%
+  mutate(pct_ND = ND/(ND + UMR) *100)
+  
+ND_overlaps_sizes_pct
+
+# summarise percent of UMR tiles
+ND_overlaps_sizes_pct_summary <- ND_overlaps_sizes_pct %>%
+  mutate(cat = ifelse(pct_ND == 0 , 0, ifelse(pct_ND > 34, ">34", "<=34"))) %>%
+  group_by(cat) %>%
+  summarise(n = n())
+
+ND_overlaps_sizes_pct_summary
+# none over 34 now
+
+
+# add sizes
+ND_overlaps_sizes_pct_size <- ND_overlaps_sizes_pct %>%
+  mutate(size = end - start) %>% 
+   mutate(size_cat = ifelse(size < 300, "small", 
+                      ifelse(size >=300 & size <900, "med", "large"))) %>%
+  mutate(UMT_cat = ifelse(size_cat %in% c("large", "med"), "UMR", "small_UMT")) %>%
+  group_by(UMT_cat) %>%
+  mutate(ID = ifelse(size_cat == "small", "UMT", paste("UMR", 1:n(), sep = "_")))
+
+#size summary
+ND_overlaps_sizes_pct_size %>% group_by(size_cat) %>% summarise(n = n()) %>% mutate(pct = n/sum(n)*100)
+# 48% small
+
+ND_overlaps_sizes_pct_size %>% filter(size_cat == "small") %>% summarise(n = n())
+
+# write output
+write.table(ND_overlaps_sizes_pct_size, paste0(out_dir_beds, "/", sample_to_crunch, "_UMTs_merge_NDs_filtered_size.bed"), sep = "\t", quote = F, row.names = F, col.names = F)
+
+# total UMR MB calculation
+
+ND_overlaps_sizes_pct_size %>% group_by(size_cat) %>% summarise(MB = sum(size)/1000000)
+
+# large - 92.4 (maize 95.9 MB)
+# med - 26.7 (maize 27.2 MB)
+# small - 12.2
+
+ND_overlaps_sizes_pct_size %>% filter(!size_cat == "small") %>% summarise(MB = sum(size)/1000000)
+# 119
+
+############################
+# UMR only - size filtered
+UMR_only_out <- ND_overlaps_sizes_pct_size %>%
+  filter(UMT_cat == "UMR")
+# 104,633
+
+# write
+write.table(UMR_only_out, paste0(out_dir_beds, "/", sample_to_crunch, "_UMRs.bed"), sep = "\t", quote = F, row.names = F, col.names = F)
+
+# 6 column version - chr, start, end, data type (umr/acr), ID, other meta data (eg category)
+UMR_only_out <- ND_overlaps_sizes_pct_size %>%
+  filter(UMT_cat == "UMR") %>%
+  select(chr, start, end, UMT_cat, ID, size_cat)
+
+# write
+write.table(UMR_only_out,  paste0(out_dir_beds, "/", sample_to_crunch, "_UMRs_6col.bed"), sep = "\t", quote = F, row.names = F, col.names = F)
+
+
+```
+
+# Sync summaries
+
+```{r, engine='bash'}
+
+#cd ~/umn/projects/UMRs/da_UMRs/mC_sorghum$ rsync -rhivPt
+
+#pcrisp@mesabi:/scratch.global/pcrisp/mC_sorghum/analysis/Sbicolor_SRR3286309_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation ./
+
+
+```
+
+
+
+
+
+
+# 7 Feb 2020
+## Compare UMR calls
+
+cd /Volumes/CBS/Groups/LAB-springer/Jaclyn/Graduate_projects/methylation/Jan2020
+scp nosha003@login.msi.umn.edu:/scratch.global/nosha003/wgbs/analysis/BN_4_S3_R1_001_mC_domains_II_cov_5_sites_2_MR_0.4_UTR_0.1/mC_UMT_annotation_beds/BN_4_S3_R1_001_UMRs_6col.bed .
+
+```{r}
+setwd ("/Volumes/CBS/Groups/LAB-springer/Jaclyn/Graduate_projects/methylation/Jan2020")
+BN4 <- read.delim("BN_4_S3_R1_001_UMRs_6col.bed", header=F, sep="\t")
+BNL <- read.delim("B73L_mC_domains_v1_annotation_v0_4_UMRs_6col_sorted.bed", header=F, sep="\t")
+
+library(dplyr)
+library(tidygenomics)
+
+nrow(BN4)
+# 104633
+nrow(BNL)
+# 107583
+
+table(BN4$V6)
+# large   med 
+# 50527 54106
+table(BNL$V6)
+# large   med 
+# 52198 55385
+
+umr_intersect <- genome_intersect(BN4, BNL, by=c("V1", "V2", "V3"))
+# 104090 / 104633 = 99.5% of the UMRs overlap between B73 samples
+table(umr_intersect[,c(4,7)])
+#        large   med
+#  large 49616  2407
+#  med    5412 46655
+
+hist(BN4$V3-BN4$V2)
+mean(BN4$V3-BN4$V2)
+# 1137.944
+min(BN4$V3-BN4$V2)
+# 300
+max(BN4$V3-BN4$V2)
+# 13200
+sum(BN4$V3-BN4$V2)
+# 119066500 / 2106338700 = 0.05652771 of the genome is called as unmethylated regions in the BN_4 sample
+
+hist(BNL$V3-BNL$V2)
+mean(BNL$V3-BNL$V2)
+# 1144.668
+min(BNL$V3-BNL$V2)
+# 300
+max(BNL$V3-BNL$V2)
+# 12700
+sum(BNL$V3-BNL$V2)
+# 123146800 / 2106338700 = 0.05846486 of the genome is called as unmethylated regions in the B73L sample
+
+```
+
+
+## Overlap UMRs and ACRs
+
+scp nosha003@login.msi.umn.edu:/scratch.global/nosha003/atac/counts/metaplot/BN1A.uniq.100bp.cpm2.bed /Volumes/CBS/Groups/LAB-springer/Jaclyn/Graduate_projects/atac/Jan2020/.
+sed '1d' BN1A.uniq.100bp.cpm2.bed > BN1A.uniq.100bp.cpm.header.bed
+awk '{if ($9 >= 2) print $0}' BN1A.uniq.100bp.cpm.header.bed > BN1A.uniq.100bp.cpm.header.gr2.bed
+awk '{if ($9 >= 3) print $0}' BN1A.uniq.100bp.cpm.header.bed > BN1A.uniq.100bp.cpm.header.gr3.bed
+
+scp nosha003@login.msi.umn.edu:/scratch.global/nosha003/atac/macs2/BN_uniq_bed_macs_peaks_neglog10qvalgr10.bed /Volumes/CBS/Groups/LAB-springer/Jaclyn/Graduate_projects/atac/Jan2020/.
+grep -v 'ctg' BN_uniq_bed_macs_peaks_neglog10qvalgr10.bed > BN_uniq_bed_macs_peaks_neglog10qvalgr10_noctg.bed
+
+```{r}
+library(dplyr)
+library(tidygenomics)
+library(ggplot2)
+
+setwd("/Volumes/CBS/Groups/LAB-springer/Jaclyn/Graduate_projects/igv/genome/")
+genes <- read.delim("Zea_mays.AGPv4.32.gene.sort.gff3", header=F, sep="\t", stringsAsFactors = F)
+colnames(genes) <- c("chr", "source", "feature", "start", "end", "dot", "strand", "dot2", "id")
+setwd("/Volumes/CBS/Groups/LAB-springer/Jaclyn/Graduate_projects/igv/genome/")
+TEs <- read.delim("B73.structuralTEv2.2018.12.20.filteredTE.disjoined.gff3", header=F, sep="\t", stringsAsFactors = F)
+TEs <- TEs[3:nrow(TEs),]
+colnames(TEs) <- c("chrom", "source", "feature", "start", "end", "dot", "strand", "dot2", "id")
+TEs$chr <- as.numeric(TEs$chrom)
+
+setwd ("/Volumes/CBS/Groups/LAB-springer/Jaclyn/Graduate_projects/methylation/Jan2020")
+UMRs <- read.delim("BN_4_S3_R1_001_UMRs_6col.bed", header=F, sep="\t", stringsAsFactors = F)
+colnames(UMRs) <- c("chr", "start", "end", "UMR", "id", "size_class")
+nrow(UMRs)
+# 104,633
+
+setwd("/Volumes/CBS/Groups/LAB-springer/Jaclyn/Graduate_projects/atac/Jan2020")
+peaks <- read.delim("BN_uniq_bed_macs_peaks_neglog10qvalgr10_noctg.bed", header=F, sep="\t", stringsAsFactors = F)
+colnames(peaks) <- c("chr", "start", "end", "id", "qvalue")
+nrow(peaks)
+# 60928
+cpm <- read.delim("BN1A.uniq.100bp.cpm.header.bed", header=T, sep="\t")
+colnames(cpm) <- c("chr", "start", "end", "dot", "strand", "dot2", "id", "count", "cpm")
+nrow(cpm)
+# 3449440
+mean(cpm$cpm)
+# 0.4336573
+ggplot(cpm) + geom_density(aes(cpm)) + xlim(0,10)
+cpm_gr2 <- read.delim("BN1A.uniq.100bp.cpm.header.gr2.bed", header=T, sep="\t")
+colnames(cpm_gr2) <- c("chr", "start", "end", "dot", "strand", "dot2", "id", "count", "cpm")
+nrow(cpm_gr2)
+# 135645
+mean(cpm_gr2$cpm)
+# 5.159875
+cpm_gr3 <- read.delim("BN1A.uniq.100bp.cpm.header.gr3.bed", header=T, sep="\t")
+colnames(cpm_gr3) <- c("chr", "start", "end", "dot", "strand", "dot2", "id", "count", "cpm")
+nrow(cpm_gr3)
+# 79357
+mean(cpm_gr3$cpm)
+# 7.103391
+
+
+umr_cpm_intersect <- genome_intersect(UMRs, cpm, by=c("chr", "start", "end"))
+mean(umr_cpm_intersect$cpm)
+# 0.975718 is the mean cpm value for ATAC regions that are UMRs
+peaks_cpm_intersect <- genome_intersect(peaks, cpm, by=c("chr", "start", "end"))
+mean(peaks_cpm_intersect$cpm)
+# 2.985242 is the mean cpm value for ATAC regions called peaks
+
+umr_peaks_intersect <- genome_intersect(UMRs, peaks, by=c("chr", "start", "end"))
+nrow(umr_peaks_intersect)
+# 25057 / 60928 = 41% of ACR peaks called intersect with UMRs
+
+
+umr_cpm2_intersect <- genome_intersect(UMRs, cpm_gr2, by=c("chr", "start", "end"))
+nrow(umr_cpm2_intersect)
+# 117645 / 135645 = 87% of the atac bins with cpm >= 2 intersect with UMRs
+mean(umr_cpm2_intersect$cpm)
+# 5.295064 is the average cpm bin value for all ATAC bins with >= cpm 2
+
+umr_cpm3_intersect <- genome_intersect(UMRs, cpm_gr3, by=c("chr", "start", "end"))
+nrow(umr_cpm3_intersect)
+# 71490 / 79357 = 90% of the atac bins with cpm >= 3 intersect with UMRs
+mean(umr_cpm3_intersect$cpm)
+# 7.146451 is the average cpm bin value for all ATAC bins with >= cpm 3
+
+
+nrow(genome_intersect(UMRs, TEs, by=c("chr", "start", "end")))
+# 19557 / 104633 = 0.1869104 of UMRs intersect TEs
+nrow(genome_intersect(peaks, TEs, by=c("chr", "start", "end")))
+# 42547 / 60928 = 0.698316 of ACR peaks intersect TEs ????
+
+UMRs_genes <- genome_join_closest(UMRs, genes, by=c("chr", "start", "end"), distance_column_name="distance", mode="left")
+nrow(subset(UMRs_genes, UMRs_genes$distance == 0))
+# 59512 / 104633 = 57% of UMRs are in genes
+nrow(subset(UMRs_genes, abs(UMRs_genes$distance) <= 2000 & UMRs_genes$distance > 0))
+# 14443 / 104633 = 14% of UMRs are in promoters
+nrow(subset(UMRs_genes, abs(UMRs_genes$distance) > 2000 & UMRs_genes$distance > 0))
+# 33938 / 104633 = 32% of UMRs are in distal regions
+
+peaks_genes <- genome_join_closest(peaks, genes, by=c("chr", "start", "end"), distance_column_name="distance", mode="left")
+nrow(subset(peaks_genes, peaks_genes$distance == 0))
+# 14750 / 60928 = 24% of peaks are in genes
+nrow(subset(peaks_genes, abs(peaks_genes$distance) <= 2000 & peaks_genes$distance > 0))
+# 7722 / 60928 = 13% of peaks are in promoters
+nrow(subset(peaks_genes, abs(peaks_genes$distance) > 2000 & peaks_genes$distance > 0))
+# 39137 / 60928 = 64% of peaks are in distal regions
+
+cpm2_genes <- genome_join_closest(cpm_gr2, genes, by=c("chr", "start", "end"), distance_column_name="distance", mode="left")
+nrow(subset(cpm2_genes, cpm2_genes$distance == 0))
+# 50107 / 135645 = 37% of bins with cpm >= 2 are in genes
+nrow(subset(cpm2_genes, abs(cpm2_genes$distance) <= 2000 & cpm2_genes$distance > 0))
+# 51406 / 135645 = 38% of bins with cpm >= 2  are in promoters
+nrow(subset(cpm2_genes, abs(cpm2_genes$distance) > 2000 & cpm2_genes$distance > 0))
+# 34949 / 135645 = 26% of bins with cpm >= 2  are in distal regions
+### OR...
+nrow(subset(cpm2_genes, abs(cpm2_genes$distance) <= 1000 & cpm2_genes$distance > 0))
+# 39248 / 135645 = 29% of bins with cpm >= 2  are in promoters
+nrow(subset(cpm2_genes, abs(cpm2_genes$distance) > 1000 & cpm2_genes$distance > 0))
+# 47107 / 135645 = 35% of bins with cpm >= 2  are in distal regions
+
+cpm3_genes <- genome_join_closest(cpm_gr3, genes, by=c("chr", "start", "end"), distance_column_name="distance", mode="left")
+nrow(subset(cpm3_genes, cpm3_genes$distance == 0))
+# 27299 / 79357 = 34% of bins with cpm >= 2 are in genes
+nrow(subset(cpm3_genes, abs(cpm3_genes$distance) <= 2000 & cpm3_genes$distance > 0))
+# 31918 / 79357 = 40% of bins with cpm >= 2  are in promoters
+nrow(subset(cpm3_genes, abs(cpm3_genes$distance) > 2000 & cpm3_genes$distance > 0))
+# 20599 / 79357 = 26% of bins with cpm >= 2  are in distal regions
+### OR...
+nrow(subset(cpm3_genes, abs(cpm3_genes$distance) <= 1000 & cpm3_genes$distance > 0))
+# 24665 / 79357 = 31% of bins with cpm >= 2  are in promoters
+nrow(subset(cpm3_genes, abs(cpm3_genes$distance) > 1000 & cpm3_genes$distance > 0))
+# 27852 / 79357 = 35% of bins with cpm >= 2  are in distal regions
+
+
+```
+
+
+##### Figures
+```{r}
+library(tidyverse)
+library(VennDiagram)
+
+# Venn of overlap between UMRs and ACR peaks
+grid.newpage()
+draw.pairwise.venn(104633, 60928, 25057, category = c("UMRs", "ACR_peaks"), lty = rep("blank", 2), fill = c("blue", "green"), alpha = rep(0.5, 2), cat.pos = c(0, 0), cat.dist = rep(0.025, 2), scaled = TRUE)
+
+# Venn of overlap between UMRs and cpm > 3 for atac
+grid.newpage()
+draw.pairwise.venn(104633, 79357, 71490, category = c("UMRs", "CPM>3"), lty = rep("blank", 2), fill = c("blue", "orange"), alpha = rep(0.5, 2), cat.pos = c(0, 0), cat.dist = rep(0.025, 2), scaled = TRUE)
+
+# Barplot of where ACR peaks are in the genome
+df <- data.frame(region = c("genic", "proximal", "distal"), ACRs = c(24, 13, 64))
+barplot(df$ACRs, names.arg=c("Genic", "Proximal (<2kb)", "Distal (>2kb)"), main = "ACR peak distribution")
+
+# Barplot of where cpm > 3 bins are in the genome
+df <- data.frame(region = c("genic", "proximal", "distal"), ACRs = c(34, 31, 35))
+barplot(df$ACRs, names.arg=c("Genic", "Proximal (<2kb)", "Distal (>2kb)"), main = "ATAC-seq CPM > 3 distribution")
+
+
+# Venn of overlap for atac cpm > 3 bins across genotypes
+grid.newpage()
+draw.triple.venn(area1 = 79357, area2 = 81667, area3 = 61992, n12 = 51678, n23 = 44045, n13 = 42707, n123 = 36810, category = c("B73", "Mo17", "Oh43"), lty = "blank", fill = c("black", "blue", "grey"))
+## calculate proportions
+51678/79357=0.6512091
+51678/81667=0.6327893
+44045/81667=0.5393243
+44045/61992=0.7104949
+42707/79357=0.538163
+42707/61992=0.6889115
+
+36810/79357=0.4638532
+36810/81667=0.4507329
+36810/61992=0.5937863
+
+draw.triple.venn(area1 = 79357, area2 = 81667, area3 = 61992, n12 = 51678, n23 = 44045, n13 = 42707, n123 = 36810, category = c("B73", "Mo17", "Oh43"), lty = "blank", fill = c("black", "blue", "grey"))
+
+
+```
+
+
+
+
+
+
+
